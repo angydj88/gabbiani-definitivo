@@ -1,0 +1,8 @@
+﻿node_modules/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+secrets.toml
+*.db
+*.log
+.env
