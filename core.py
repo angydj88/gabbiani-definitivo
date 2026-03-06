@@ -476,10 +476,14 @@ class MotorVision:
         from google import genai
         
         if self.backend == "vertex_ai":
+            from google.oauth2 import service_account
+            creds = service_account.Credentials.from_service_account_info(
+                secrets_dict["gcp_service_account"])
             self.client = genai.Client(
                 vertexai=True, 
                 project=secrets_dict.get("GCP_PROJECT", ""), 
-                location=secrets_dict.get("GCP_LOCATION", "europe-west1")
+                location=secrets_dict.get("GCP_LOCATION", "europe-west1"),
+                credentials=creds
             )
         else:
             self.client = genai.Client(api_key=secrets_dict.get("GEMINI_API_KEY", ""))
