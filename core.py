@@ -23,7 +23,9 @@ logger = logging.getLogger("GABBIANI")
 # ══════════════════════════════════════════════════════════════════════════════
 # SCHEMAS
 # ══════════════════════════════════════════════════════════════════════════════
-class PiezaSchema(typing.TypedDict):
+from pydantic import BaseModel
+
+class PiezaSchema(BaseModel):
     id: str
     nombre: str
     largo: float
@@ -33,20 +35,8 @@ class PiezaSchema(typing.TypedDict):
     cantidad: int
     notas: str
 
-SCHEMA_VERTEX = {
-    "type": "ARRAY",
-    "items": {
-        "type": "OBJECT",
-        "properties": {
-            "id": {"type": "STRING"}, "nombre": {"type": "STRING"},
-            "largo": {"type": "NUMBER"}, "ancho": {"type": "NUMBER"},
-            "espesor": {"type": "NUMBER"}, "material": {"type": "STRING"},
-            "cantidad": {"type": "INTEGER"}, "notas": {"type": "STRING"}
-        },
-        "required": ["id","nombre","largo","ancho","espesor","material",
-                      "cantidad","notas"]
-    }
-}
+SCHEMA_VERTEX = list[PiezaSchema]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ENUMS + TRAZABILIDAD
@@ -482,28 +472,19 @@ class MotorVision:
         self.backend = backend
         self.model_name = model_name
         self.limiter = get_rate_limiter(model_name)
+        
+        from google import genai
+        
         if self.backend == "vertex_ai":
-            self._init_vertex(secrets_dict)
+            self.client = genai.Client(
+                vertexai=True, 
+                project=secrets_dict.get("GCP_PROJECT", ""), 
+                location=secrets_dict.get("GCP_LOCATION", "europe-west1")
+            )
         else:
-            self._init_google_ai(secrets_dict)
-        logger.info(f"MotorVision: backend={self.backend}, model={model_name}")
-
-    def _init_vertex(self, secrets):
-        import vertexai
-        from google.oauth2 import service_account
-        from vertexai.generative_models import GenerativeModel
-        creds = service_account.Credentials.from_service_account_info(
-            secrets["gcp_service_account"])
-        vertexai.init(project=secrets["GCP_PROJECT"],
-                      location=secrets.get("GCP_LOCATION","europe-west1"),
-                      credentials=creds)
-        self._model = GenerativeModel(self.model_name)
-
-    def _init_google_ai(self, secrets):
-        import google.generativeai as genai
-        genai.configure(api_key=secrets["GEMINI_API_KEY"])
-        self._genai = genai
-        self._model = genai.GenerativeModel(self.model_name)
+            self.client = genai.Client(api_key=secrets_dict.get("GEMINI_API_KEY", ""))
+            
+        logger.info(f"MotorVision: backend={self.backend}, model={model_name} (google-genai SDK)")
 
     def analizar(self, imagen: Image.Image, texto_vectorial: str = "",
                  max_intentos: int = 4) -> list:
@@ -525,10 +506,7 @@ Si hay discrepancia entre texto e imagen, prioriza el texto vectorial.
                 self.limiter.wait()
                 logger.info(f"  📡 API call (intento {intento+1}/{max_intentos})...")
 
-                if self.backend == "vertex_ai":
-                    texto_respuesta = self._call_vertex(prompt, img_bytes)
-                else:
-                    texto_respuesta = self._call_google_ai(prompt, img_bytes)
+                texto_respuesta = self._call_unified(prompt, img_bytes)
 
                 datos = json.loads(texto_respuesta)
                 if isinstance(datos, dict): datos = [datos]
@@ -563,41 +541,54 @@ Si hay discrepancia entre texto e imagen, prioriza el texto vectorial.
                     return [{"error": str(e)}]
         return []
 
-    def _call_vertex(self, prompt, img_bytes):
-        from vertexai.generative_models import Part, GenerationConfig
-        img_part = Part.from_data(data=img_bytes, mime_type="image/png")
-        resp = self._model.generate_content(
-            [prompt, img_part],
-            generation_config=GenerationConfig(
-                temperature=0.1, response_mime_type="application/json",
-                response_schema=SCHEMA_VERTEX))
+    def _call_unified(self, prompt, img_bytes) -> str:
+        from google.genai import types
+        img_part = types.Part.from_bytes(data=img_bytes, mime_type="image/png")
+        
+        config_kwargs = {
+            "temperature": 0.1,
+            "response_mime_type": "application/json",
+            "response_schema": SCHEMA_VERTEX
+        }
+        
+        model_lower = self.model_name.lower()
+        if "3.1" in model_lower:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.LOW
+            )
+
+        resp = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[prompt, img_part],
+            config=types.GenerateContentConfig(**config_kwargs)
+        )
         return resp.text
 
-    def _call_google_ai(self, prompt, img_bytes):
-        resp = self._model.generate_content(
-            [prompt, {"mime_type":"image/png","data":img_bytes}],
-            generation_config=self._genai.GenerationConfig(
-                temperature=0.1, response_mime_type="application/json",
-                response_schema=list[PiezaSchema]))
-        return resp.text
-
-    def _fallback_fix(self, texto_roto):
-        self.limiter.wait()  # Rate limit también aquí
+    def _fallback_fix(self, texto_roto) -> list:
+        from google.genai import types
+        self.limiter.wait()
         pf = f"Corrige este JSON y devuelve SOLO el array JSON válido:\n{texto_roto}"
-        if self.backend == "vertex_ai":
-            from vertexai.generative_models import GenerationConfig
-            resp = self._model.generate_content([pf],
-                generation_config=GenerationConfig(
-                    temperature=0.0, response_mime_type="application/json",
-                    response_schema=SCHEMA_VERTEX))
-        else:
-            resp = self._model.generate_content([pf],
-                generation_config=self._genai.GenerationConfig(
-                    temperature=0.0, response_mime_type="application/json",
-                    response_schema=list[PiezaSchema]))
+        
+        config_kwargs = {
+            "temperature": 0.0,
+            "response_mime_type": "application/json",
+            "response_schema": SCHEMA_VERTEX
+        }
+        
+        model_lower = self.model_name.lower()
+        if "3.1" in model_lower:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.LOW
+            )
+
+        resp = self.client.models.generate_content(
+            model=self.model_name,
+            contents=pf,
+            config=types.GenerateContentConfig(**config_kwargs)
+        )
         d = json.loads(resp.text)
         self.limiter.report_success()
-        return [d] if isinstance(d,dict) else d
+        return [d] if isinstance(d, dict) else d
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CEREBRO OPERARIO V5

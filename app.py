@@ -31,7 +31,7 @@ def _get_secret(key, default=None):
         return os.environ.get(key, default)
 
 BACKEND = _get_secret("BACKEND", "google_ai")
-GEMINI_MODEL = _get_secret("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = _get_secret("GEMINI_MODEL", "gemini-3.1-pro-preview")
 MAX_WORKERS = 1  # Secuencial para respetar rate limits EU
 backend_label = "Vertex AI" if BACKEND == "vertex_ai" else "Google AI Studio"
 
